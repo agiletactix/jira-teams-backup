@@ -1,0 +1,19 @@
+# Config that may hold your site, email or org ID
+teams.yaml
+teams.yml
+config.yaml
+config.yml
+.env
+.env.*
+*.token
+
+# Snapshots contain your issue keys and team names
+snapshots/
+team-bindings-*.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/

@@ -1,0 +1,16 @@
+# Copy to teams.yaml (it is gitignored) and edit.
+# Environment variables override anything set here. The API token is never read from this file.
+
+# site: yoursite            # or JIRA_SITE
+# email: you@example.com    # or JIRA_EMAIL
+# org_id: your-org-id   # or ATLASSIAN_ORG_ID
+# team_field_id: customfield_10001               # optional, auto-detected if left out
+
+teams:
+  - name: Team Alpha
+    description: Example stream-aligned team.
+    # members:                        # optional Atlassian account IDs to add
+    #   - 5b10ac8d82e05b22cc7d4ef5
+  - name: Team Bravo
+    description: Example platform team.
+  - name: Team Charlie
