@@ -181,6 +181,38 @@ def fetch_live_teams(session: requests.Session, org_id: str, site_id: str) -> Di
     return out
 
 
+def fetch_team_member_ids(session: requests.Session, org_id: str, site_id: str, team_id: str) -> List[str]:
+    """Account IDs of a team's members. The endpoint is a POST but it only reads:
+    the body carries the paging cursor ('after') and page size ('first'). Paginated."""
+    ids: List[str] = []
+    after: Optional[str] = None
+    while True:
+        body: Dict[str, Any] = {"first": 50}
+        if after:
+            body["after"] = after
+        data = request_with_retry(
+            session, "POST", f"{TEAMS_API_BASE}/{org_id}/teams/{team_id}/members",
+            params={"siteId": site_id}, json=body,
+        ).json()
+        ids.extend(m["accountId"] for m in data.get("results", []))
+        page = data.get("pageInfo") or {}
+        after = page.get("endCursor")
+        if not page.get("hasNextPage") or not after:
+            break
+    return ids
+
+
+def fetch_user(session: requests.Session, base_url: str, account_id: str) -> Optional[Dict[str, Any]]:
+    """GET one Jira user. Returns {"displayName", "active"}, or None when the account
+    is gone (404). Read-only."""
+    resp = session.request("GET", f"{base_url}/rest/api/3/user", params={"accountId": account_id}, timeout=30)
+    if resp.status_code in (400, 404):
+        return None
+    resp.raise_for_status()
+    data = resp.json()
+    return {"displayName": data.get("displayName"), "active": bool(data.get("active", True))}
+
+
 def team_value_from_issue(issue: Dict[str, Any], field_id: str) -> Dict[str, Any]:
     """The Team field reads back as an object with id and name, or null."""
     return (issue.get("fields") or {}).get(field_id) or {}

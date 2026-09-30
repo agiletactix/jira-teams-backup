@@ -80,15 +80,21 @@ def print_plan(rows: List[Dict[str, Any]], apply: bool) -> None:
     print(f"\n{n_create} to create, {len(rows) - n_create} already exist.")
 
 
-def create_team(session: requests.Session, org_id: str, site_id: str, name: str, description: str) -> Dict[str, Any]:
-    payload = {"displayName": name, "description": description, "teamType": "OPEN", "siteId": site_id}
+def create_team(session: requests.Session, org_id: str, site_id: str, name: str, description: str, team_type: str = "OPEN") -> Dict[str, Any]:
+    payload = {"displayName": name, "description": description, "teamType": team_type, "siteId": site_id}
     resp = common.request_with_retry(session, "POST", f"{TEAMS_API_BASE}/{org_id}/teams", json=payload)
     return resp.json()
 
 
-def add_members(session: requests.Session, org_id: str, team_id: str, account_ids: List[str]) -> None:
+def add_members(session: requests.Session, org_id: str, team_id: str, account_ids: List[str]) -> Dict[str, Any]:
+    """Add-only. The API answers 200 with per-account failures in `errors`, so callers
+    should look at the returned body."""
     payload = {"members": [{"accountId": a} for a in account_ids]}
-    common.request_with_retry(session, "POST", f"{TEAMS_API_BASE}/{org_id}/teams/{team_id}/members/add", json=payload)
+    resp = common.request_with_retry(session, "POST", f"{TEAMS_API_BASE}/{org_id}/teams/{team_id}/members/add", json=payload)
+    try:
+        return resp.json() or {}
+    except ValueError:
+        return {}
 
 
 def cmd_list(settings: Settings) -> int:

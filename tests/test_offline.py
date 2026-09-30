@@ -30,10 +30,18 @@ class FakeResponse:
 class FakeSession:
     """Routes by URL suffix. Records every non-GET call so tests can assert none happened."""
 
-    def __init__(self, live_teams, issues):
+    def __init__(self, live_teams, issues, members=None, users=None):
         self.live_teams, self.issues, self.writes = live_teams, issues, []
+        self.members = members or {}   # teamId -> [accountId]
+        self.users = users or {}       # accountId -> {"displayName", "active"}; absent = 404
 
     def request(self, method, url, **kw):
+        if method == "POST" and url.endswith("/members"):  # list members: a read
+            return FakeResponse({"results": [{"accountId": a} for a in self.members.get(url.split("/")[-2], [])],
+                                 "pageInfo": {"hasNextPage": False, "endCursor": None}})
+        if method == "GET" and url.endswith("/rest/api/3/user"):
+            u = self.users.get(kw["params"]["accountId"])
+            return FakeResponse(u or {}, 200 if u else 404)
         if method != "GET":
             self.writes.append((method, url, kw.get("json")))
             return FakeResponse({"teamId": "new-id"})
@@ -133,6 +141,129 @@ class TestSnapshotRestore(unittest.TestCase):
             with mock.patch.object(common, "make_session", return_value=fake):
                 self.assertEqual(restore.main(["--snapshot", str(p)]), 0)
             self.assertEqual(fake.writes, [])
+            with mock.patch.object(common, "make_session", return_value=fake):
+                self.assertEqual(restore.main(["--snapshot", str(p), "--apply", "--rate-limit-seconds", "0"]), 0)
+            self.assertEqual(len(fake.writes), 1)
+            self.assertEqual(fake.writes[0][2], {"fields": {"customfield_99": "new-1"}})
+
+
+def team(tid, name, **kw):
+    return {"teamId": tid, "displayName": name, "description": name + " d", "teamType": "OPEN", "state": "ACTIVE",
+            "externalReference": kw.get("ext"), }
+
+
+USERS = {"u1": {"displayName": "Una", "active": True}, "u2": {"displayName": "Dev", "active": True},
+         "u3": {"displayName": "Off", "active": False}}  # u9 is absent: removed
+
+
+class TestMembers(unittest.TestCase):
+    SNAP_TEAMS = [
+        {"name": "Alpha", "description": "A", "type": "CLOSED", "state": "ACTIVE", "managed_by": None,
+         "members": [{"accountId": "u1", "displayName": "Una"}, {"accountId": "u2", "displayName": "Dev"},
+                     {"accountId": "u3", "displayName": "Off"}, {"accountId": "u9", "displayName": None}]},
+        {"name": "Synced", "description": "S", "type": "OPEN", "state": "ACTIVE", "managed_by": "ATLASSIAN_GROUP",
+         "members": [{"accountId": "u1", "displayName": "Una"}]},
+    ]
+
+    def snapshot_file(self, d, teams="default"):
+        p = Path(d) / "s.json"
+        body = {"bindings": {"A-1": "Alpha"}, "generated_at": "now"}
+        if teams == "default":
+            body["teams"] = self.SNAP_TEAMS
+        p.write_text(json.dumps(body))
+        return p
+
+    def test_snapshot_records_members_readonly(self):
+        fake = FakeSession([team("t1", "Alpha"), team("t2", "Synced", ext={"source": "ATLASSIAN_GROUP", "id": "g"})], [],
+                           members={"t1": ["u1", "u9"], "t2": ["u1"]}, users=USERS)
+        defs = snap.fetch_team_definitions(fake, "https://example.atlassian.net", "org-1", "cloud-1")
+        by = {t["name"]: t for t in defs}
+        self.assertEqual(by["Alpha"]["members"], [{"accountId": "u1", "displayName": "Una"}, {"accountId": "u9", "displayName": None}])
+        self.assertEqual(by["Synced"]["managed_by"], "ATLASSIAN_GROUP")
+        self.assertEqual(by["Alpha"]["type"], "OPEN")
+        self.assertEqual(fake.writes, [])
+        out = snap.build_snapshot({}, base_url="x", field_id="f", jql="j", teams=defs)
+        self.assertIn("teams", out)
+        self.assertNotIn("teams", snap.build_snapshot({}, base_url="x", field_id="f", jql="j"))
+
+    def plan(self, live, members):
+        fake = FakeSession(live, [], members=members, users=USERS)
+        by = {}
+        for t in live:
+            by.setdefault(t["displayName"], []).append(t)
+        lm, us = restore.gather_team_state(fake, "https://example.atlassian.net", "org-1", "cloud-1", self.SNAP_TEAMS, by)
+        return restore.plan_teams(self.SNAP_TEAMS, by, lm, us), fake
+
+    def test_plan_create_skips_inactive_and_group_synced(self):
+        rows, fake = self.plan([], {})
+        alpha, synced = rows
+        self.assertEqual(alpha["action"], "create")
+        self.assertEqual([m["accountId"] for m in alpha["to_add"]], ["u1", "u2"])
+        self.assertEqual({m["accountId"]: m["why"] for m in alpha["inactive"]},
+                         {"u3": "account is deactivated", "u9": "account not found"})
+        self.assertEqual(synced["action"], "create")
+        self.assertEqual(synced["to_add"], [])
+        self.assertTrue(synced["members_skipped_reason"])
+        self.assertEqual(fake.writes, [])
+
+    def test_existing_team_adds_only_missing_never_removes(self):
+        rows, _ = self.plan([team("t1", "Alpha"), team("t2", "Synced")], {"t1": ["u1", "zz"], "t2": []})
+        self.assertEqual(rows[0]["action"], "reuse")
+        self.assertEqual([m["accountId"] for m in rows[0]["to_add"]], ["u2"])
+        self.assertEqual(rows[0]["already"], 1)
+
+    def test_live_verified_team_skipped(self):
+        rows, _ = self.plan([team("t1", "Alpha"), team("t2", "Synced", ext={"source": "ATLASSIAN_GROUP"})], {"t1": []})
+        self.assertEqual(rows[1]["action"], "reuse")
+        self.assertEqual(rows[1]["to_add"], [])
+        self.assertIn("synced", rows[1]["members_skipped_reason"])
+
+    def test_dry_run_plans_but_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as d, env():
+            p = self.snapshot_file(d)
+            fake = FakeSession([], [{"key": "A-1", "team": None}], users=USERS)
+            with mock.patch.object(common, "make_session", return_value=fake):
+                self.assertEqual(restore.main(["--snapshot", str(p)]), 0)
+            self.assertEqual(fake.writes, [])
+
+    def test_apply_creates_adds_and_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as d, env():
+            p = self.snapshot_file(d)
+            fake = FakeSession([], [{"key": "A-1", "team": None}], users=USERS)
+
+            def request(method, url, **kw):
+                if method == "POST" and url.endswith("/teams"):
+                    fake.writes.append((method, url, kw["json"]))
+                    fake.live_teams.append(team("new-a", kw["json"]["displayName"]))
+                    return FakeResponse({"teamId": "new-a"}, 201)
+                if method == "POST" and url.endswith("/members/add"):
+                    fake.writes.append((method, url, kw["json"]))
+                    fake.members.setdefault(url.split("/")[-3], []).extend(m["accountId"] for m in kw["json"]["members"])
+                    return FakeResponse({"members": kw["json"]["members"], "errors": []})
+                return orig(method, url, **kw)
+            orig = fake.request
+            fake.request = request
+            args = ["--snapshot", str(p), "--apply", "--rate-limit-seconds", "0"]
+            with mock.patch.object(common, "make_session", return_value=fake):
+                self.assertEqual(restore.main(args), 0)
+            kinds = [(w[0], w[1].rsplit("/", 1)[-1]) for w in fake.writes]
+            self.assertEqual(kinds.count(("POST", "teams")), 2)  # Alpha and Synced
+            adds = [w for w in fake.writes if w[1].endswith("/members/add")]
+            self.assertEqual([m["accountId"] for m in adds[0][2]["members"]], ["u1", "u2"])
+            self.assertEqual(len(adds), 1)  # Synced got none
+            created = [w[2] for w in fake.writes if w[1].endswith("/teams")]
+            self.assertEqual(created[0]["teamType"], "CLOSED")
+            self.assertFalse(any(w[0] in ("DELETE", "PATCH") or w[1].endswith("/members/remove") for w in fake.writes))
+            n = len(fake.writes)
+            # second run: teams exist now, members present. Only the issue binding may still be written.
+            with mock.patch.object(common, "make_session", return_value=fake):
+                self.assertEqual(restore.main(args), 0)
+            self.assertFalse([w for w in fake.writes[n:] if w[0] == "POST"])
+
+    def test_old_format_snapshot_still_restores_bindings(self):
+        with tempfile.TemporaryDirectory() as d, env():
+            p = self.snapshot_file(d, teams=None)
+            fake = FakeSession([team("new-1", "Alpha")], TestSnapshotRestore.ISSUES)
             with mock.patch.object(common, "make_session", return_value=fake):
                 self.assertEqual(restore.main(["--snapshot", str(p), "--apply", "--rate-limit-seconds", "0"]), 0)
             self.assertEqual(len(fake.writes), 1)

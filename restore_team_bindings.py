@@ -1,22 +1,30 @@
 #!/usr/bin/env python3
-"""restore_team_bindings.py: point issues back at the team with the same NAME.
+"""restore_team_bindings.py: bring teams, members and issue bindings back.
 
-Reads a snapshot from snapshot_team_bindings.py, finds the team that currently has
-each name, and sets the Team field on every issue that does not already match.
+Reads a snapshot from snapshot_team_bindings.py and runs two phases.
+
+  Phase 1, teams (only if the snapshot has team definitions):
+    - Creates any team whose name is not live, with the saved description and type.
+    - Adds the saved members who are missing, by account ID.
+  Phase 2, bindings:
+    - Sets the Team field on every issue that does not already point at the team
+      that currently has the saved name. Re-reads each issue first, so re-running
+      only touches what is still wrong.
 
 DRY RUN unless you pass --apply. The dry run makes read-only calls only.
 
-What it does:
-  - Sets the Team field on issues, and nothing else.
-  - Re-reads each issue's current value first, so re-running is safe and only
-    touches what is still wrong.
+Skipped and reported, never forced:
+  - Teams whose membership is synced from an Atlassian group (the API will not
+    take manual members). Reconnect the group in Atlassian Administration.
+  - Members whose account is deactivated or gone.
+  - Teams that were archived when the snapshot was taken.
+  - A name that matches more than one live team. Nothing is guessed.
 
-What it does not do:
-  - It does NOT restore team membership. Members are not in the snapshot and this
-    script never adds or removes a member. A recreated team comes back with
-    whatever members you give it (see teams.py).
-  - It does NOT create teams. A name with no live team is reported and skipped.
-  - It does not touch issues that are not in the snapshot.
+It never deletes or removes anything. A team that already exists with other
+members gets the missing ones added and keeps everyone else. Parent teams are
+not restored, because the Teams API does not expose them.
+
+Older snapshots with no team definitions still work: phase 1 is skipped.
 """
 from __future__ import annotations
 
@@ -29,6 +37,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import common
+import teams as teams_mod
 
 SEARCH_PATH = "/rest/api/3/search/jql"
 CHUNK = 50
@@ -51,6 +60,126 @@ def resolve_names(live: Dict[str, List[Dict[str, Any]]], names: List[str]) -> Di
         else:
             out[name] = {"id": matches[0].get("teamId"), "problem": None}
     return out
+
+
+INACTIVE_REASONS = {"deactivated": "account is deactivated", "removed": "account not found"}
+PLACEHOLDER_ID = "<new team>"
+
+
+def plan_teams(snap_teams: List[Dict[str, Any]], live: Dict[str, List[Dict[str, Any]]],
+               live_members: Dict[str, List[str]], user_status: Dict[str, Optional[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    """Pure. One row per snapshot team.
+
+    action: create | reuse | ambiguous | archived
+    members_skipped_reason: None, or why no members will be added (group-synced)
+    to_add: [{accountId, displayName}], already: count, inactive: [{accountId, displayName, why}]
+    live_members: teamId -> account IDs. user_status: accountId -> {"active"} or None (gone).
+    """
+    rows = []
+    for t in snap_teams:
+        name = t["name"]
+        matches = live.get(name) or []
+        row: Dict[str, Any] = {"name": name, "description": t.get("description") or name, "type": t.get("type") or "OPEN",
+                               "team_id": None, "to_add": [], "already": 0, "inactive": [], "members_skipped_reason": None}
+        if t.get("state", "ACTIVE") != "ACTIVE":
+            rows.append({**row, "action": "archived"})
+            continue
+        if len(matches) > 1:
+            rows.append({**row, "action": "ambiguous"})
+            continue
+        if matches:
+            row["action"], row["team_id"] = "reuse", matches[0].get("teamId")
+            managed = bool(matches[0].get("externalReference"))
+        else:
+            row["action"] = "create"
+            managed = False
+        if managed:
+            row["members_skipped_reason"] = "membership is synced from a group on the live team"
+        elif t.get("managed_by") and not matches:
+            row["members_skipped_reason"] = "membership was synced from a group when saved; reconnect the group after the team is created"
+        else:
+            have = set(live_members.get(row["team_id"] or "", []))
+            for m in t.get("members") or []:
+                aid = m["accountId"]
+                if aid in have:
+                    row["already"] += 1
+                    continue
+                st = user_status.get(aid, {"active": True})
+                if st is None:
+                    row["inactive"].append({**m, "why": INACTIVE_REASONS["removed"]})
+                elif not st.get("active", True):
+                    row["inactive"].append({**m, "why": INACTIVE_REASONS["deactivated"]})
+                else:
+                    row["to_add"].append(m)
+        rows.append(row)
+    return rows
+
+
+def print_team_plan(rows: List[Dict[str, Any]]) -> None:
+    print("TEAMS PLAN")
+    for r in rows:
+        label = {"create": "CREATE", "reuse": "REUSE", "ambiguous": "SKIP", "archived": "SKIP"}[r["action"]]
+        line = f"  {label:6}  {r['name']}"
+        if r["action"] == "ambiguous":
+            line += "  (more than one live team has this name)"
+        elif r["action"] == "archived":
+            line += "  (archived when saved)"
+        elif r["members_skipped_reason"]:
+            line += f"  members skipped: {r['members_skipped_reason']}"
+        else:
+            line += f"  {len(r['to_add'])} member(s) to add, {r['already']} already there"
+        print(line)
+        for m in r["inactive"]:
+            print(f"            skip member {m.get('displayName') or m['accountId']}: {m['why']}")
+    n_create = sum(1 for r in rows if r["action"] == "create")
+    n_add = sum(len(r["to_add"]) for r in rows)
+    print(f"\n{n_create} team(s) to create, {n_add} member(s) to add.")
+
+
+def gather_team_state(session, base_url: str, org_id: str, site_id: str, snap_teams: List[Dict[str, Any]],
+                      live: Dict[str, List[Dict[str, Any]]]):
+    """Read-only lookups the plan needs: live members of matching teams and the
+    status of each saved member who is not already on the team."""
+    live_members: Dict[str, List[str]] = {}
+    for t in snap_teams:
+        matches = live.get(t["name"]) or []
+        if len(matches) == 1 and not matches[0].get("externalReference"):
+            tid = matches[0]["teamId"]
+            live_members[tid] = common.fetch_team_member_ids(session, org_id, site_id, tid)
+    user_status: Dict[str, Optional[Dict[str, Any]]] = {}
+    for t in snap_teams:
+        matches = live.get(t["name"]) or []
+        have = set(live_members.get(matches[0]["teamId"], [])) if len(matches) == 1 else set()
+        for m in t.get("members") or []:
+            aid = m["accountId"]
+            if aid not in have and aid not in user_status:
+                user_status[aid] = common.fetch_user(session, base_url, aid)
+    return live_members, user_status
+
+
+def apply_team_plan(session, org_id: str, site_id: str, rows: List[Dict[str, Any]]) -> int:
+    failed = 0
+    for r in rows:
+        if r["action"] not in ("create", "reuse"):
+            continue
+        name = r["name"]
+        try:
+            team_id = r["team_id"]
+            if r["action"] == "create":
+                team_id = teams_mod.create_team(session, org_id, site_id, name, r["description"], r["type"]).get("teamId")
+                print(f"  [{name}] created, id={team_id}")
+            if r["to_add"]:
+                result = teams_mod.add_members(session, org_id, team_id, [m["accountId"] for m in r["to_add"]])
+                errors = result.get("errors") or []
+                print(f"  [{name}] added {len(r['to_add']) - len(errors)} member(s)")
+                for e in errors:
+                    failed += 1
+                    common.eprint(f"  [{name}] member not added: {e}")
+        except Exception as e:  # noqa: BLE001 - keep going, re-run is idempotent
+            failed += 1
+            common.eprint(f"  [{name}] FAILED: {e}")
+    print(f"\nTeams phase done, {failed} failure(s).")
+    return failed
 
 
 def fetch_current(session, base_url: str, field_id: str, keys: List[str]) -> Dict[str, Dict[str, Any]]:
@@ -140,7 +269,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default=None)
     ap.add_argument("--snapshot", default=None, help="snapshot file (default: newest in snapshots/)")
-    ap.add_argument("--apply", action="store_true", help="actually set the Team field. Default is a dry run.")
+    ap.add_argument("--apply", action="store_true", help="actually write (teams, members, Team field). Default is a dry run.")
+    ap.add_argument("--bindings-only", action="store_true", help="skip the teams phase and only re-point issues")
     ap.add_argument("--rate-limit-seconds", type=float, default=0.2, help="pause between writes (default 0.2)")
     ap.add_argument("--max-retries", type=int, default=5, help="retries per call on HTTP 429")
     args = ap.parse_args(argv)
@@ -160,13 +290,35 @@ def main(argv: Optional[List[str]] = None) -> int:
     field_id = common.resolve_team_field_id(session, settings)
 
     live = common.fetch_live_teams(session, org_id, site_id)
+
+    snap_teams = None if args.bindings_only else snapshot.get("teams")
+    if snap_teams is None:
+        print("No team definitions in this snapshot (or --bindings-only). Skipping the teams phase.\n")
+    else:
+        live_members, user_status = gather_team_state(session, settings.base_url, org_id, site_id, snap_teams, live)
+        team_rows = plan_teams(snap_teams, live, live_members, user_status)
+        print_team_plan(team_rows)
+        if args.apply:
+            print("\nAPPLYING TEAMS")
+            if apply_team_plan(session, org_id, site_id, team_rows):
+                common.eprint("Some team steps failed. Fix them and re-run; finished steps are skipped. Bindings not attempted.")
+                return 1
+            live = common.fetch_live_teams(session, org_id, site_id)
+        else:
+            # Dry run: pretend the teams that would be created exist, so the bindings
+            # plan shows what will happen after they do.
+            for r in team_rows:
+                if r["action"] == "create":
+                    live = {**live, r["name"]: [{"teamId": PLACEHOLDER_ID}]}
+        print()
+
     resolved = resolve_names(live, sorted({n for n in bindings.values() if n}, key=str))
     current = fetch_current(session, settings.base_url, field_id, sorted(bindings))
     rows = build_plan({k: v for k, v in bindings.items() if v}, resolved, current)
     print_plan(rows)
 
     if not args.apply:
-        print("\nDry run. Nothing was written. Pass --apply to set the Team field.")
+        print("\nDry run. Nothing was written. Pass --apply to create teams, add members and set the Team field.")
         return 0
     if not any(r["status"] == "update" for r in rows):
         print("\nNothing to update.")
