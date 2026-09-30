@@ -4,7 +4,10 @@
 Reads a snapshot from snapshot_team_bindings.py and runs two phases.
 
   Phase 1, teams (only if the snapshot has team definitions):
-    - Creates any team whose name is not live, with the saved description and type.
+    - For a team whose name is not live, first tries to REACTIVATE it by its saved
+      team ID (POST /teams/{teamId}/restore). That works for a team deleted within
+      the last 30 days and keeps its ID and its issue links. Only if that is not
+      possible does it recreate the team by name, which gives it a NEW ID.
     - Adds the saved members who are missing, by account ID.
   Phase 2, bindings:
     - Sets the Team field on every issue that does not already point at the team
@@ -22,7 +25,9 @@ Skipped and reported, never forced:
 
 It never deletes or removes anything. A team that already exists with other
 members gets the missing ones added and keeps everyone else. Parent teams are
-not restored, because the Teams API does not expose them.
+not restored: the REST API used here does not cover them. Atlassian's GraphQL
+API does, and this script does not use it yet. (Deleting a team also unlinks it
+from its parent and sub-teams, even if it is reactivated.)
 
 Older snapshots with no team definitions still work: phase 1 is skipped.
 """
@@ -38,6 +43,8 @@ from typing import Any, Dict, List, Optional
 
 import common
 import teams as teams_mod
+
+TEAMS_API_BASE = common.TEAMS_API_BASE
 
 SEARCH_PATH = "/rest/api/3/search/jql"
 CHUNK = 50
@@ -70,7 +77,9 @@ def plan_teams(snap_teams: List[Dict[str, Any]], live: Dict[str, List[Dict[str, 
                live_members: Dict[str, List[str]], user_status: Dict[str, Optional[Dict[str, Any]]]) -> List[Dict[str, Any]]:
     """Pure. One row per snapshot team.
 
-    action: create | reuse | ambiguous | archived
+    action: reactivate | create | reuse | ambiguous | archived
+    reactivate = the snapshot has this team's ID, so a reactivation is tried first;
+    apply falls back to create if Atlassian says it cannot be restored.
     members_skipped_reason: None, or why no members will be added (group-synced)
     to_add: [{accountId, displayName}], already: count, inactive: [{accountId, displayName, why}]
     live_members: teamId -> account IDs. user_status: accountId -> {"active"} or None (gone).
@@ -91,7 +100,8 @@ def plan_teams(snap_teams: List[Dict[str, Any]], live: Dict[str, List[Dict[str, 
             row["action"], row["team_id"] = "reuse", matches[0].get("teamId")
             managed = bool(matches[0].get("externalReference"))
         else:
-            row["action"] = "create"
+            row["action"] = "reactivate" if t.get("id") else "create"
+            row["saved_id"] = t.get("id")
             managed = False
         if managed:
             row["members_skipped_reason"] = "membership is synced from a group on the live team"
@@ -118,8 +128,16 @@ def plan_teams(snap_teams: List[Dict[str, Any]], live: Dict[str, List[Dict[str, 
 def print_team_plan(rows: List[Dict[str, Any]]) -> None:
     print("TEAMS PLAN")
     for r in rows:
-        label = {"create": "CREATE", "reuse": "REUSE", "ambiguous": "SKIP", "archived": "SKIP"}[r["action"]]
+        label = {"reactivate": "REACT", "create": "CREATE", "reuse": "REUSE", "ambiguous": "SKIP", "archived": "SKIP"}[r["action"]]
         line = f"  {label:6}  {r['name']}"
+        if r["action"] == "reactivate":
+            line += "  would reactivate (keeps ID and links); recreates with a new ID if it cannot be restored"
+            if r["members_skipped_reason"]:
+                line += f"; members skipped: {r['members_skipped_reason']}"
+            print(line)
+            for m in r["inactive"]:
+                print(f"            skip member {m.get('displayName') or m['accountId']}: {m['why']}")
+            continue
         if r["action"] == "ambiguous":
             line += "  (more than one live team has this name)"
         elif r["action"] == "archived":
@@ -131,9 +149,12 @@ def print_team_plan(rows: List[Dict[str, Any]]) -> None:
         print(line)
         for m in r["inactive"]:
             print(f"            skip member {m.get('displayName') or m['accountId']}: {m['why']}")
+    n_react = sum(1 for r in rows if r["action"] == "reactivate")
     n_create = sum(1 for r in rows if r["action"] == "create")
     n_add = sum(len(r["to_add"]) for r in rows)
-    print(f"\n{n_create} team(s) to create, {n_add} member(s) to add.")
+    print(f"\n{n_react} team(s) to reactivate, {n_create} to create, {n_add} member(s) to add.")
+    if n_create:
+        print("Recreated teams get a new ID. A team deleted in the last 30 days should be reactivated instead.")
 
 
 def gather_team_state(session, base_url: str, org_id: str, site_id: str, snap_teams: List[Dict[str, Any]],
@@ -157,15 +178,39 @@ def gather_team_state(session, base_url: str, org_id: str, site_id: str, snap_te
     return live_members, user_status
 
 
+def reactivate_team(session, org_id: str, team_id: str) -> bool:
+    """POST /teams/{teamId}/restore. True on success. False if Atlassian says the
+    team cannot be restored (404 not found, 400 invalid, 403 forbidden), so the
+    caller can fall back to recreating it. Anything else is raised."""
+    try:
+        common.request_with_retry(session, "POST", f"{TEAMS_API_BASE}/{org_id}/teams/{team_id}/restore")
+        return True
+    except Exception as e:  # noqa: BLE001
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        if status in (400, 403, 404):
+            return False
+        raise
+
+
 def apply_team_plan(session, org_id: str, site_id: str, rows: List[Dict[str, Any]]) -> int:
     failed = 0
     for r in rows:
-        if r["action"] not in ("create", "reuse"):
+        if r["action"] not in ("reactivate", "create", "reuse"):
             continue
         name = r["name"]
         try:
             team_id = r["team_id"]
-            if r["action"] == "create":
+            action = r["action"]
+            if action == "reactivate":
+                if reactivate_team(session, org_id, r["saved_id"]):
+                    team_id = r["saved_id"]
+                    print(f"  [{name}] reactivated, id={team_id} (same ID, links kept)")
+                    have = set(common.fetch_team_member_ids(session, org_id, site_id, team_id))
+                    r["to_add"] = [m for m in r["to_add"] if m["accountId"] not in have]
+                else:
+                    print(f"  [{name}] could not be reactivated, recreating by name (new ID)")
+                    action = "create"
+            if action == "create":
                 team_id = teams_mod.create_team(session, org_id, site_id, name, r["description"], r["type"]).get("teamId")
                 print(f"  [{name}] created, id={team_id}")
             if r["to_add"]:
@@ -308,7 +353,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             # Dry run: pretend the teams that would be created exist, so the bindings
             # plan shows what will happen after they do.
             for r in team_rows:
-                if r["action"] == "create":
+                if r["action"] in ("create", "reactivate"):
                     live = {**live, r["name"]: [{"teamId": PLACEHOLDER_ID}]}
         print()
 

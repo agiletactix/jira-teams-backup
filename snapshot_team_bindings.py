@@ -10,14 +10,17 @@ the team with the same name.
 
 This script only issues GET requests. It changes nothing in Jira.
 
-It also records the team definitions: name, description, type (OPEN or CLOSED),
-state, whether membership is synced from an Atlassian group, and the members
-(account ID plus display name). restore_team_bindings.py uses that to recreate
-missing teams and add missing members before it re-points the issues.
+It also records the team definitions: team ID, name, description, membership
+setting (the REST API calls it teamType: OPEN or MEMBER_INVITE, not official vs
+regular), state, whether membership is synced from an Atlassian group, and the
+members (account ID plus display name). restore_team_bindings.py uses that to
+reactivate or recreate missing teams and add missing members before it re-points
+the issues. The saved team ID is what lets it try a reactivation first.
 
 Needs the organization ID for the team definitions. Without one it records the
-issue bindings only and says so. The Teams API exposes no parent team, so parents
-are not captured.
+issue bindings only and says so. The REST API used here does not cover the team
+hierarchy (parent teams) or the team type (regular vs official). Atlassian's
+GraphQL Teams API does, and this script does not use it yet, so neither is captured.
 
 Member lists come from POST .../members, which only reads (the body carries the
 paging cursor). Nothing here writes.
@@ -59,7 +62,7 @@ def fetch_bindings(session, base_url: str, field_id: str, jql: str = DEFAULT_JQL
 
 
 def fetch_team_definitions(session, base_url: str, org_id: str, site_id: str) -> List[Dict[str, Any]]:
-    """One record per team: name, description, type, state, managed_by, members."""
+    """One record per team: id, name, description, type, state, managed_by, members."""
     live = common.fetch_live_teams(session, org_id, site_id)
     users: Dict[str, Optional[Dict[str, Any]]] = {}
     out: List[Dict[str, Any]] = []
@@ -73,6 +76,7 @@ def fetch_team_definitions(session, base_url: str, org_id: str, site_id: str) ->
                 members.append({"accountId": account_id, "displayName": u.get("displayName")})
             ref = e.get("externalReference") or {}
             out.append({
+                "id": e["teamId"],
                 "name": e["displayName"],
                 "description": e.get("description") or "",
                 "type": e.get("teamType") or "OPEN",

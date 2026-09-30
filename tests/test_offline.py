@@ -7,6 +7,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import requests
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import common  # noqa: E402
@@ -24,7 +26,7 @@ class FakeResponse:
 
     def raise_for_status(self):
         if self.status_code >= 400:
-            raise RuntimeError(f"HTTP {self.status_code}")
+            raise requests.HTTPError(f"HTTP {self.status_code}", response=self)
 
 
 class FakeSession:
@@ -268,6 +270,79 @@ class TestMembers(unittest.TestCase):
                 self.assertEqual(restore.main(["--snapshot", str(p), "--apply", "--rate-limit-seconds", "0"]), 0)
             self.assertEqual(len(fake.writes), 1)
             self.assertEqual(fake.writes[0][2], {"fields": {"customfield_99": "new-1"}})
+
+
+class TestReactivate(unittest.TestCase):
+    SNAP = [{"id": "old-a", "name": "Alpha", "description": "A", "type": "OPEN", "state": "ACTIVE", "managed_by": None,
+             "members": [{"accountId": "u1", "displayName": "Una"}]}]
+
+    def setup_fake(self, restore_status):
+        fake = FakeSession([], [], users=USERS)
+        orig = fake.request
+
+        def request(method, url, **kw):
+            if method == "POST" and url.endswith("/restore"):
+                fake.writes.append((method, url, None))
+                return FakeResponse({}, restore_status)
+            if method == "POST" and url.endswith("/teams"):
+                fake.writes.append((method, url, kw["json"]))
+                fake.live_teams.append(team("new-a", "Alpha"))
+                return FakeResponse({"teamId": "new-a"}, 201)
+            if method == "POST" and url.endswith("/members/add"):
+                fake.writes.append((method, url, kw["json"]))
+                return FakeResponse({"errors": []})
+            return orig(method, url, **kw)
+        fake.request = request
+        return fake
+
+    def rows(self, fake):
+        lm, us = restore.gather_team_state(fake, "https://example.atlassian.net", "org-1", "cloud-1", self.SNAP, {})
+        return restore.plan_teams(self.SNAP, {}, lm, us)
+
+    def test_plan_marks_reactivate_only_with_saved_id(self):
+        fake = self.setup_fake(204)
+        self.assertEqual(self.rows(fake)[0]["action"], "reactivate")
+        no_id = [{k: v for k, v in self.SNAP[0].items() if k != "id"}]
+        self.assertEqual(restore.plan_teams(no_id, {}, {}, {})[0]["action"], "create")
+
+    def test_dry_run_says_would_reactivate_and_writes_nothing(self):
+        fake = self.setup_fake(204)
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            restore.print_team_plan(self.rows(fake))
+        self.assertIn("would reactivate", buf.getvalue())
+        self.assertIn("keeps ID and links", buf.getvalue())
+        self.assertEqual(fake.writes, [])
+
+    def test_apply_reactivates_by_saved_id_without_creating(self):
+        fake = self.setup_fake(204)
+        failed = restore.apply_team_plan(fake, "org-1", "cloud-1", self.rows(fake))
+        self.assertEqual(failed, 0)
+        urls = [w[1] for w in fake.writes]
+        self.assertTrue(urls[0].endswith("/teams/old-a/restore"))
+        self.assertFalse(any(u.endswith("/teams") for u in urls))
+        self.assertTrue(any(u.endswith("/teams/old-a/members/add") for u in urls))
+
+    def test_apply_falls_back_to_create_when_not_restorable(self):
+        fake = self.setup_fake(404)
+        failed = restore.apply_team_plan(fake, "org-1", "cloud-1", self.rows(fake))
+        self.assertEqual(failed, 0)
+        urls = [w[1] for w in fake.writes]
+        self.assertTrue(urls[0].endswith("/restore"))
+        self.assertTrue(any(u.endswith("/teams") for u in urls))
+
+    def test_other_errors_are_not_swallowed(self):
+        fake = self.setup_fake(500)
+        failed = restore.apply_team_plan(fake, "org-1", "cloud-1", self.rows(fake))
+        self.assertEqual(failed, 1)
+        self.assertFalse(any(w[1].endswith("/teams") for w in fake.writes))
+
+    def test_snapshot_records_team_id(self):
+        fake = FakeSession([team("t1", "Alpha")], [], members={"t1": []}, users=USERS)
+        defs = snap.fetch_team_definitions(fake, "https://example.atlassian.net", "org-1", "cloud-1")
+        self.assertEqual(defs[0]["id"], "t1")
 
 
 if __name__ == "__main__":

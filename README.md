@@ -2,7 +2,7 @@
 
 Delete a team in Jira and every issue that pointed at it shows "Unknown" in the Team field.
 
-Atlassian gives you roughly 30 days to reactivate a deleted team from its profile page. That brings back the team name, description and members. If you rebuild teams on purpose, or miss the window, the team is gone and the issues stay orphaned. A recreated team with the same name gets a new ID, so nothing reconnects on its own. And there is no bulk edit for the Team field.
+Atlassian gives you roughly 30 days to reactivate a deleted team, from its profile page or through the REST API. That brings the same team back: same ID, same issue links. If you rebuild teams on purpose, or miss the window, the team is gone and the issues stay orphaned. A recreated team with the same name gets a **new ID**, so nothing reconnects on its own. And there is no bulk edit for the Team field.
 
 So the fix is to write down each team (name, description, members) and which issue belongs to which team **name** before you touch anything, then rebuild the teams and point the issues back afterward.
 
@@ -12,9 +12,9 @@ So the fix is to write down each team (name, description, members) and which iss
 
 | Script | What it does | Writes to Jira? |
 |---|---|---|
-| `snapshot_team_bindings.py` | Saves a JSON file: every team (name, description, type, members) and issue key -> team name | Never. Reads only. |
+| `snapshot_team_bindings.py` | Saves a JSON file: every team (ID, name, description, membership setting, members) and issue key -> team name | Never. Reads only. |
 | `teams.py` | Lists teams. Creates the ones from your roster that are missing, matched by name | Only with `--apply` |
-| `restore_team_bindings.py` | Recreates missing teams, adds missing members, then sets the Team field on issues | Only with `--apply` |
+| `restore_team_bindings.py` | Reactivates missing teams by their saved ID if Atlassian allows it, otherwise recreates them by name. Adds missing members, then sets the Team field on issues | Only with `--apply` |
 
 ## Quick start
 
@@ -62,33 +62,36 @@ python3 restore_team_bindings.py            # dry run: per-team plan, then per-i
 python3 restore_team_bindings.py --apply
 ```
 
-The teams phase runs first: it creates missing teams and adds missing members. Then the issues are re-pointed. If you only want the issues, pass `--bindings-only`. (`teams.py create` still works if you would rather build teams from a hand-written roster.)
+The teams phase runs first: it reactivates or recreates missing teams and adds missing members. Then the issues are re-pointed. If you only want the issues, pass `--bindings-only`. (`teams.py create` still works if you would rather build teams from a hand-written roster.)
 
 Run the dry run again afterward. When everything is restored it reports every issue as already right.
 
 ## What each script does and does not do
 
 **`snapshot_team_bindings.py`**
-- Does: record issue key -> team name for every issue with a Team set (change the scope with `--jql`). Also record every team: name, description, type (open or closed), state, whether its membership is synced from a group, and its members (account ID and display name).
-- Does not: record parent teams. The Teams API does not expose them. Pass `--skip-teams` for issue bindings only.
+- Does: record issue key -> team name for every issue with a Team set (change the scope with `--jql`). Also record every team: ID, name, description, membership setting (open or closed), state, whether its membership is synced from a group, and its members (account ID and display name).
+- Does not: record parent teams or the team type (regular vs official). The REST API used here doesn't cover the team hierarchy; Atlassian's GraphQL API does, and this script doesn't use it yet. The saved "membership setting" is the REST `teamType` field (open or invite-only). It says nothing about official vs regular. Pass `--skip-teams` for issue bindings only.
 
 **`teams.py`**
 - Does: create missing teams from your roster, skip ones that already exist by name, and add members you list under `members:` (or yourself with `--add-me`).
 - Does not: delete or rename anything. Members are only ever added.
 
 **`restore_team_bindings.py`**
-- Does: create teams that are missing, by name, with the saved description and type. Add the saved members who are not on the team yet. Then set the Team field on issues in the snapshot. It re-reads everything first, so existing teams, existing members and correct issues are skipped and it is safe to re-run.
+- Does: for a team that is missing, first try to **reactivate** it by its saved ID with the REST [restore endpoint](https://developer.atlassian.com/platform/teams/rest/v1/api-group-teams-public-api/#api-public-teams-v1-org-orgid-teams-teamid-restore-post). That only works for a team deleted within the last 30 days, and it keeps the ID and issue links. If Atlassian says it can't be restored (or the snapshot has no team ID, as in older snapshots), recreate it by name with the saved description and membership setting. A recreated team has a new ID. Add the saved members who are not on the team yet. Then set the Team field on issues in the snapshot. It re-reads everything first, so existing teams, existing members and correct issues are skipped and it is safe to re-run.
 - Skips and reports, never forces:
   - Teams whose membership is synced from a group. The API will not take manual members for them. Reconnect the group in Atlassian Administration.
   - Members whose account is deactivated or no longer exists.
   - Teams that were archived when the snapshot was taken.
   - A name that matches more than one live team. Nothing is guessed.
 - A team that already exists with different members gets the missing ones added. Nobody is removed.
-- Does not: delete anything, remove members, or restore parent teams.
+- Does not: delete anything, remove members, or restore parent teams. Deleting a team unlinks it from its parent and sub-teams even if you reactivate it later, so re-link those by hand.
+- In a dry run the script can't tell whether a team is still inside the 30-day window without writing, so it prints "would reactivate" and falls back to recreating only when you apply.
 - Old snapshots with no team definitions still work. The teams phase is skipped and the issues are re-pointed as before.
 - Does not touch issues that are not in the snapshot.
 
 ## Good to know
+
+- If a team was deleted in the last 30 days, reactivate it (Atlassian UI, or this script) instead of recreating it. Recreating gives it a new ID.
 
 - Tested against a Jira Cloud site I own. Try the dry runs on your own site first.
 - Member lists come from an endpoint that is a POST but only reads. Nothing writes without `--apply`.
